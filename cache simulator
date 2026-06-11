@@ -1,0 +1,535 @@
+
+// Simulador de Cache - Sistema de cache configurável com políticas LRU e FIFO
+// Autores: Davi Barros, Henrique Belli 
+// Descrição: Simula o funcionamento de uma memória cache com endereços configuráveis
+
+#include <algorithm>
+#include <cctype>
+#include <cstdint>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <tuple>
+#include <vector>
+
+using namespace std;
+
+// Enumeração para as políticas de substituição de linhas de cache
+enum class politicaDeSubstuicao {
+    LRU,   // Least Recently Used - Remove a linha menos recentemente usada
+    FIFO   // First In First Out - Remove a linha inserida há mais tempo
+};
+
+// Estrutura que representa uma linha de cache
+struct CacheLine {
+    bool valid = false;           // Indica se a linha contém dados válidos
+    uint64_t tag = 0;             // Tag da linha para identificação do bloco
+    uint64_t insertedAt = 0;      // Ciclo em que a linha foi inserida (para FIFO)
+    uint64_t lastUsedAt = 0;      // Ciclo do último acesso à linha (para LRU)
+};
+
+// Estrutura para armazenar o resultado de um acesso à cache
+struct resultadoDosAcessos {
+    uint64_t address;             // Endereço acessado
+    uint64_t tag;                 // Tag extraída do endereço
+    uint64_t index;               // Índice do conjunto na cache
+    uint64_t offset;              // Offset dentro do bloco
+    bool hit;                     // true se foi acerto, false se foi falha
+    size_t setIndex;              // Índice do conjunto onde ocorreu o acesso
+    size_t wayIndex;              // Índice da via dentro do conjunto
+};
+
+// Classe principal que simula o funcionamento de uma memória cache
+class SimuladorDeCache {
+public:
+    // Construtor: inicializa a cache com os parâmetros especificados
+    // Parâmetros: tamanhoCache, tamanhoBloco, associatividade, addrBits, politica
+    SimuladorDeCache(uint64_t tamanhoCache, uint64_t tamanhoBloco, uint64_t associatividade, uint64_t addrBits, politicaDeSubstuicao politica)
+        : tamanhoCache(tamanhoCache),
+          tamanhoBloco(tamanhoBloco),
+          associatividade(associatividade),
+          addrBits(addrBits),
+          politica(politica) {
+        validarParametros();
+        offsetBits = contagemDeZeros(tamanhoBloco);
+        lineCount = tamanhoCache / tamanhoBloco;
+        setCount = lineCount / associatividade;
+        indexBits = contagemDeZeros(setCount);
+        tagBits = static_cast<int64_t>(addrBits) - offsetBits - indexBits;
+        if (tagBits < 0) {
+            throw invalid_argument("Parâmetros inconsistentes: bits de tag negativos.");
+        }
+        cacheSets.assign(setCount, vector<CacheLine>(associatividade));
+    }
+
+    // Simula um acesso à cache com o endereço fornecido
+    // Retorna: resultadoDosAcessos com informações sobre o acesso (hit/miss)
+    resultadoDosAcessos access(uint64_t address) {
+        uint64_t tag, index, offset;
+        tie(tag, index, offset) = decomposeAddress(address);
+        auto &set = cacheSets[index];
+        uint64_t now = ciclos++;
+
+        // Procura pela tag no conjunto (hit detection)
+        for (size_t way = 0; way < associatividade; ++way) {
+            CacheLine &line = set[way];
+            if (line.valid && line.tag == tag) {
+                line.lastUsedAt = now;
+                hits++;
+                return resultadoDosAcessos{address, tag, index, offset, true, static_cast<size_t>(index), way};
+            }
+        }
+
+        // Falha na cache - encontra vítima e insere novo bloco
+        misses++;
+        size_t victimWay = findVictimWay(set);
+        CacheLine &line = set[victimWay];
+        line.valid = true;
+        line.tag = tag;
+        line.insertedAt = now;
+        line.lastUsedAt = now;
+
+        return resultadoDosAcessos{address, tag, index, offset, false, static_cast<size_t>(index), victimWay};
+    }
+
+    // Exibe a configuração da cache
+    void printConfiguracao() const {
+        cout << "=== Configuracao da Cache ===\n";
+        cout << "Tamanho total: " << tamanhoCache << " bytes\n";
+        cout << "Tamanho do bloco: " << tamanhoBloco << " bytes\n";
+        cout << "Associatividade: " << associatividade << "-way\n";
+        cout << "Bits de endereco: " << addrBits << "\n";
+        cout << "Offset bits: " << offsetBits << "\n";
+        cout << "Index bits: " << indexBits << "\n";
+        cout << "Tag bits: " << tagBits << "\n";
+        if (associatividade > 1) {
+            cout << "Politica de substituicao: " << (politica == politicaDeSubstuicao::LRU ? "LRU" : "FIFO") << "\n";
+        }
+        cout << "Numero de conjuntos: " << setCount << "\n";
+        cout << "Linhas por conjunto: " << associatividade << "\n";
+        cout << "============================\n\n";
+    }
+
+    // Exibe informações detalhadas sobre um acesso à cache
+    void printresultadoDosAcessos(const resultadoDosAcessos &result) const {
+        cout << "Endereco: 0x" << hex << uppercase << setw((addrBits + 3) / 4) << setfill('0') << result.address;
+        cout << dec << nouppercase << setfill(' ');
+        cout << " | tag=0x" << hex << result.tag;
+        cout << " index=0x" << result.index;
+        cout << " offset=0x" << result.offset;
+        cout << dec;
+        cout << " | " << (result.hit ? "ACERTO" : "FALHA") << "\n";
+        cout << "Conjunto " << result.setIndex << " , via " << result.wayIndex << "\n";
+        cout << "Estado da cache apos o acesso:\n";
+        printCacheState();
+        cout << "-------------------------------------------------------------\n";
+    }
+
+
+    // Exibe o estado completo da cache
+    void printCacheState() const {
+        for (size_t setIdx = 0; setIdx < setCount; ++setIdx) {
+            cout << "Conjunto " << setIdx << ": ";
+            for (size_t way = 0; way < associatividade; ++way) {
+                const CacheLine &line = cacheSets[setIdx][way];
+                cout << "[Via " << way << ": ";
+                if (!line.valid) {
+                    cout << "V=0] ";
+                } else {
+                    cout << "V=1 T=0x" << hex << line.tag << dec;
+                    cout << " ins=" << line.insertedAt;
+                    cout << " last=" << line.lastUsedAt << ";] ";
+                }
+            }
+            cout << "\n";
+        }
+    }
+
+    // Exibe relatório final com estatísticas de desempenho
+    void printRelatorio() const {
+        cout << "\n=== Relatorio de desempenho ===\n";
+        cout << "Total de acessos: " << totalAccesses() << "\n";
+        cout << "Acertos: " << hits << "\n";
+        cout << "Falhas: " << misses << "\n";
+        cout << "Taxa de acertos: " << porcentagem(hits) << "%\n";
+        cout << "Taxa de falhas: " << porcentagem(misses) << "%\n";
+        cout << "===============================\n";
+    }
+
+    // Retorna o número total de acessos à cache
+    uint64_t totalAccesses() const {
+        return hits + misses;
+    }
+
+private:
+    // Parâmetros de configuração da cache
+    uint64_t tamanhoCache;        // Tamanho total em bytes
+    uint64_t tamanhoBloco;        // Tamanho de cada linha em bytes
+    uint64_t associatividade;     // Número de vias por conjunto
+    uint64_t addrBits;            // Número total de bits de endereço
+    politicaDeSubstuicao politica; 
+
+    // Bits para decomposição de endereço
+    uint64_t offsetBits = 0;      // Bits de offset (log2 do tamanho do bloco)
+    uint64_t indexBits = 0;       // Bits de índice (log2 do número de conjuntos)
+    int64_t tagBits = 0;          // Bits de tag (bits restantes)
+
+    // Dimensões da cache
+    uint64_t lineCount = 0;       // Número total de linhas
+    uint64_t setCount = 0;        // Número de conjuntos
+
+    // Contadores de ciclos e estatísticas
+    uint64_t ciclos = 1;          // Contador de ciclos de clock
+    uint64_t hits = 0;            // Número de acertos
+    uint64_t misses = 0;          // Número de falhas
+
+    // Estrutura da cache (conjuntos de linhas)
+    vector<vector<CacheLine>> cacheSets;
+
+    // Valida se os parâmetros de configuração são consistentes
+    void validarParametros() const {
+        if (!potenciaDe2(tamanhoCache) || tamanhoCache == 0) {
+            throw invalid_argument("Tamanho de cache invalido: deve ser potencia de 2 e maior que zero.");
+        }
+        if (!potenciaDe2(tamanhoBloco) || tamanhoBloco == 0) {
+            throw invalid_argument("Tamanho de bloco invalido: deve ser potencia de 2 e maior que zero.");
+        }
+        if (tamanhoCache < tamanhoBloco) {
+            throw invalid_argument("Tamanho de cache deve ser maior ou igual ao tamanho do bloco.");
+        }
+        if (!potenciaDe2(associatividade) || associatividade == 0) {
+            throw invalid_argument("Associatividade invalida: deve ser potencia de 2 e maior que zero.");
+        }
+        if (tamanhoCache / tamanhoBloco < associatividade) {
+            throw invalid_argument("Associatividade invalida: numero de vias excede o numero de linhas da cache.");
+        }
+        if (addrBits == 0 || addrBits > 64) {
+            throw invalid_argument("Numero de bits de endereco invalido.");
+        }
+    }
+
+    // Verifica se um número é potência de 2
+    static bool potenciaDe2(uint64_t x) {
+        return x != 0 && (x & (x - 1)) == 0;
+    }
+
+    // Calcula o logaritmo base 2 (número de bits necessários)
+    static uint64_t contagemDeZeros(uint64_t x) {
+        uint64_t count = 0;
+        while (x > 1) {
+            x >>= 1;
+            ++count;
+        }
+        return count;
+    }
+
+    // Decompõe um endereço em tag, índice e offset
+    tuple<uint64_t, uint64_t, uint64_t> decomposeAddress(uint64_t address) const {
+        uint64_t offsetMask = (offsetBits == 64 ? numeric_limits<uint64_t>::max() : ((uint64_t(1) << offsetBits) - 1));
+        uint64_t indexMask = (indexBits == 0 ? 0 : ((uint64_t(1) << indexBits) - 1));
+        uint64_t offset = address & offsetMask;
+        uint64_t index = (address >> offsetBits) & indexMask;
+        uint64_t tag = address >> (offsetBits + indexBits);
+        return {tag, index, offset};
+    }
+
+    // Encontra a vítima para substituição usando a política especificada
+    size_t findVictimWay(const vector<CacheLine> &set) const {
+        // Primeiro, procura por uma linha inválida (vazia)
+        for (size_t way = 0; way < associatividade; ++way) {
+            if (!set[way].valid) {
+                return way;
+            }
+        }
+        
+        size_t victim = 0;
+        if (politica == politicaDeSubstuicao::FIFO) {
+            // FIFO: remove a linha inserida há mais tempo
+            uint64_t minInserted = set[0].insertedAt;
+            for (size_t way = 1; way < associatividade; ++way) {
+                if (set[way].insertedAt < minInserted) {
+                    minInserted = set[way].insertedAt;
+                    victim = way;
+                }
+            }
+        } else {
+            // LRU: remove a linha menos recentemente usada
+            uint64_t minUsed = set[0].lastUsedAt;
+            for (size_t way = 1; way < associatividade; ++way) {
+                if (set[way].lastUsedAt < minUsed) {
+                    minUsed = set[way].lastUsedAt;
+                    victim = way;
+                }
+            }
+        }
+        return victim;
+    }
+
+    // Calcula a porcentagem de um valor em relação ao total de acessos
+    double porcentagem(uint64_t value) const {
+        if (totalAccesses() == 0) {
+            return 0.0;
+        }
+        return (static_cast<double>(value) * 100.0) / static_cast<double>(totalAccesses());
+    }
+};
+
+
+// Exibe mensagem de uso do programa
+static void printUso(const string &programName) {
+    cout << "Uso: " << programName << " --cache-size <bytes> --block-size <bytes> --assoc <associatividade> --addr-bits <bits> --input <arquivo> [--politica LRU|FIFO]" << "\n";
+    cout << "Parametros adicionais:\n";
+    cout << "  --politica   Politica de substituicao para associatividade > 1 (LRU ou FIFO, padrao LRU)\n";
+    cout << "  --help     Exibe esta mensagem\n";
+}
+
+// Remove espaços em branco do início e fim de uma string
+static string trimString(const string &text) {
+    string result;
+    size_t start = 0;
+    while (start < text.size() && isspace(static_cast<unsigned char>(text[start]))) {
+        ++start;
+    }
+    size_t end = text.size();
+    while (end > start && isspace(static_cast<unsigned char>(text[end - 1]))) {
+        --end;
+    }
+    result.assign(text.begin() + start, text.begin() + end);
+    return result;
+}
+
+// Verifica se um caminho é absoluto
+static bool isAbsolutePath(const string &path) {
+    if (path.empty()) {
+        return false;
+    }
+    if (path[0] == '/' || path[0] == '\\') {
+        return true;
+    }
+    if (path.size() >= 2 && isalpha(static_cast<unsigned char>(path[0])) && path[1] == ':') {
+        return true;
+    }
+    return false;
+}
+
+// Normaliza um caminho de arquivo (remove espaços)
+static string normalizePath(const string &path) {
+    string trimmed = trimString(path);
+    return trimmed;
+}
+
+// Converte uma string em uint64_t (suporta hex com prefixo "0x")
+static bool parseUint64(const string &text, uint64_t &value) {
+    string trimmed;
+    copy_if(text.begin(), text.end(), back_inserter(trimmed), [](char c) { return !isspace(static_cast<unsigned char>(c)); });
+    if (trimmed.empty()) {
+        return false;
+    }
+    istringstream stream(trimmed);
+    if (trimmed.rfind("0x", 0) == 0 || trimmed.rfind("0X", 0) == 0) {
+        stream >> hex >> value;
+    } else {
+        stream >> dec >> value;
+    }
+    return !stream.fail() && stream.eof();
+}
+
+// Carrega endereços de um arquivo de entrada
+// Suporta valores hexadecimais (prefixo 0x) e decimais
+// Ignora linhas vazias e comentários (linha começada com #)
+static vector<uint64_t> loadAddresses(const string &filename, uint64_t addrBits) {
+    string path = normalizePath(filename);
+    ifstream file(path);
+    if (!file && !isAbsolutePath(path)) {
+        // Se o arquivo não foi encontrado e o caminho é relativo, tenta procurar em diretórios anteriores
+        string prefix;
+        for (int depth = 1; depth <= 4; ++depth) {
+            prefix += "../";
+            ifstream attempt(prefix + path);
+            if (attempt) {
+                file.swap(attempt);
+                path = prefix + path;
+                break;
+            }
+        }
+    }
+    if (!file) {
+        throw runtime_error("Nao foi possivel abrir o arquivo de entrada: " + filename);
+    }
+
+    vector<uint64_t> addresses;
+    string line;
+    size_t lineNumber = 0;
+    uint64_t addressLimit = (addrBits == 64 ? numeric_limits<uint64_t>::max() : ((uint64_t(1) << addrBits) - 1));
+
+    while (getline(file, line)) {
+        ++lineNumber;
+        // Remove espaços e verifica se a linha é vazia ou comentário
+        string trimmed;
+        for (string::size_type pos = 0; pos < line.size(); ++pos) {
+            unsigned char ch = static_cast<unsigned char>(line[pos]);
+            if (!isspace(ch)) {
+                trimmed.push_back(line[pos]);
+            }
+        }
+        if (trimmed.empty() || trimmed[0] == '#') {
+            continue;
+        }
+        uint64_t address;
+        if (!parseUint64(trimmed, address)) {
+            throw runtime_error("Endereco invalido na linha " + to_string(lineNumber) + ": " + line);
+        }
+        if (address > addressLimit) {
+            throw runtime_error("Endereco fora do espaco de enderecamento na linha " + to_string(lineNumber) + ".");
+        }
+        addresses.push_back(address);
+    }
+    return addresses;
+}
+
+// Função principal
+int main(int argc, char *argv[]) {
+    try {
+        if (argc == 1) {
+            cout << "Modo interativo:\n";
+        }
+
+        // Variáveis para armazenar os parâmetros
+        uint64_t tamanhoCache = 0;
+        uint64_t tamanhoBloco = 0;
+        uint64_t associatividade = 0;
+        uint64_t addrBits = 0;
+        string inputFile;
+        politicaDeSubstuicao politica = politicaDeSubstuicao::LRU;
+
+        // Processa argumentos de linha de comando
+        for (int i = 1; i < argc; ++i) {
+            string arg = argv[i];
+            if (arg == "--help" || arg == "-h") {
+                printUso(argv[0]);
+                return 0;
+            }
+            if (arg == "--cache-size" && i + 1 < argc) {
+                if (!parseUint64(argv[++i], tamanhoCache)) {
+                    throw invalid_argument("Valor invalido para --cache-size");
+                }
+                continue;
+            }
+            if (arg == "--block-size" && i + 1 < argc) {
+                if (!parseUint64(argv[++i], tamanhoBloco)) {
+                    throw invalid_argument("Valor invalido para --block-size");
+                }
+                continue;
+            }
+            if (arg == "--assoc" && i + 1 < argc) {
+                if (!parseUint64(argv[++i], associatividade)) {
+                    throw invalid_argument("Valor invalido para --assoc");
+                }
+                continue;
+            }
+            if (arg == "--addr-bits" && i + 1 < argc) {
+                if (!parseUint64(argv[++i], addrBits)) {
+                    throw invalid_argument("Valor invalido para --addr-bits");
+                }
+                continue;
+            }
+            if (arg == "--input" && i + 1 < argc) {
+                inputFile = argv[++i];
+                continue;
+            }
+            if (arg == "--politica" && i + 1 < argc) {
+                string value = argv[++i];
+                if (value == "LRU" || value == "lru" || value == "Lru") {
+                    politica = politicaDeSubstuicao::LRU;
+                } else if (value == "FIFO" || value == "fifo" || value == "Fifo") {
+                    politica = politicaDeSubstuicao::FIFO;
+                } else {
+                    throw invalid_argument("Politica de substituicao invalida: use LRU ou FIFO.");
+                }
+                continue;
+            }
+            throw invalid_argument("Parametro desconhecido: " + arg);
+        }
+
+        // Se algum parâmetro está faltando, entra em modo interativo
+        if (tamanhoCache == 0 || tamanhoBloco == 0 || associatividade == 0 || addrBits == 0 || inputFile.empty()) {
+            cout << "Informe os parametros abaixo:\n";
+            while (tamanhoCache == 0) {
+                cout << "Cache size (bytes): ";
+                string value;
+                if (!getline(cin, value) || !parseUint64(value, tamanhoCache)) {
+                    cout << "Valor invalido. Tente novamente.\n";
+                    tamanhoCache = 0;
+                }
+            }
+            while (tamanhoBloco == 0) {
+                cout << "Block size (bytes): ";
+                string value;
+                if (!getline(cin, value) || !parseUint64(value, tamanhoBloco)) {
+                    cout << "Valor invalido. Tente novamente.\n";
+                    tamanhoBloco = 0;
+                }
+            }
+            while (associatividade == 0) {
+                cout << "associatividade (1,2,4,8...): ";
+                string value;
+                if (!getline(cin, value) || !parseUint64(value, associatividade)) {
+                    cout << "Valor invalido. Tente novamente.\n";
+                    associatividade = 0;
+                }
+            }
+            while (addrBits == 0) {
+                cout << "Addr bits: ";
+                string value;
+                if (!getline(cin, value) || !parseUint64(value, addrBits)) {
+                    cout << "Valor invalido. Tente novamente.\n";
+                    addrBits = 0;
+                }
+            }
+            while (inputFile.empty()) {
+                cout << "Arquivo de entrada: ";
+                if (!getline(cin, inputFile) || trimString(inputFile).empty()) {
+                    cout << "Informe um caminho de arquivo valido.\n";
+                    inputFile.clear();
+                } else {
+                    inputFile = trimString(inputFile);
+                }
+            }
+            if (associatividade > 1) {
+                cout << "Politica de substituicao (LRU/FIFO) [LRU]: ";
+                string value;
+                if (getline(cin, value) && !value.empty()) {
+                    if (value == "FIFO" || value == "fifo" || value == "Fifo") {
+                        politica = politicaDeSubstuicao::FIFO;
+                    } else {
+                        politica = politicaDeSubstuicao::LRU;
+                    }
+                }
+            }
+        }
+
+        // Carrega endereços do arquivo e cria o simulador
+        auto addresses = loadAddresses(inputFile, addrBits);
+        SimuladorDeCache simulator(tamanhoCache, tamanhoBloco, associatividade, addrBits, politica);
+        simulator.printConfiguracao();
+
+        // Processa cada endereço e exibe os resultados
+        for (size_t i = 0; i < addresses.size(); ++i) {
+            resultadoDosAcessos result = simulator.access(addresses[i]);
+            cout << "Acesso " << (i + 1) << ":\n";
+            simulator.printresultadoDosAcessos(result);
+        }
+        
+        // Exibe relatório final
+        simulator.printRelatorio();
+        return 0;
+    } catch (const exception &ex) {
+        cerr << "Erro: " << ex.what() << "\n";
+        cerr << "Use --help para ver os parametros corretos.\n";
+        return 1;
+    }
+}
